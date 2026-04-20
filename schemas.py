@@ -40,6 +40,7 @@ class PostOut(BaseModel):
     likes_count: int                # 新增按讚數
     # comments: List[CommentOut] = [] # 留言列表
     comments: List[CommentOut] = Field(default_factory=list)
+    top_comment_id: Optional[int] = None    # 帶出目前置頂的是哪一則留言
 
     class Config:
         from_attributes = True

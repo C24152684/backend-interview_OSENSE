@@ -16,7 +16,7 @@ from database import engine, Base, get_db
 # from models import User
 # from schemas import UserCreate, UserOut, Token, TokenData, PostCreate, PostOut
 from auth import create_access_token, SECRET_KEY, ALGORITHM
-from utils import get_optional_current_user, get_who_blocked_me, get_my_blacklist_ids, serialize_comment
+from utils import get_optional_current_user, get_who_blocked_me, get_my_blacklist_ids, serialize_comment, sanitize_content
 
 
 
@@ -104,21 +104,6 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     return {"access_token": access_token, "token_type": "bearer"}
 
 # 建立一個輔助函數：獲取當前登入的使用者
-# async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
-#     credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
-#     try:
-#         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-#         username: str = payload.get("sub")
-#         if username is None:
-#             raise credentials_exception
-#     except JWTError:
-#         raise credentials_exception
-        
-#     result = await db.execute(select(models.User).where(models.User.username == username))
-#     user = result.scalars().first()
-#     if user is None:
-#         raise credentials_exception
-#     return user
 async def get_current_user(
         token: str = Depends(oauth2_scheme),
         db: AsyncSession = Depends(get_db),
@@ -129,16 +114,14 @@ async def get_current_user(
 
         if not username:
             raise HTTPException(401, "invalid token")
-
         result = await db.execute(
             select(models.User).where(models.User.username == username)
         )
 
         user = result.scalars().first()
-
         if not user:
             raise HTTPException(401, "user not found")
-
+        
         return user
 
     except JWTError:
@@ -161,17 +144,30 @@ async def create_post(
     db: AsyncSession = Depends(get_db), 
     current_user: models.User = Depends(get_current_user)
 ):
+    # 將使用者輸入做安全處理
+    clean_content = sanitize_content(post_data.content)
+    if not clean_content.strip():
+        raise HTTPException(status_code=400, detail="內容不可為空或是 HTML 等語法")
+
     new_post = models.Post(
-        content=post_data.content,
+        content=clean_content,   # DB: 只存「純文字」
         owner_id=current_user.id
     )
     db.add(new_post)
     await db.commit()
     await db.refresh(new_post)
     
-    # 為了回傳給前端顯示，手動附加上 username
-    new_post.username = current_user.username
-    return new_post
+    # response_model 完整輸出前端需要欄位
+    return schemas.PostOut(
+        id=new_post.id,
+        content=new_post.content,
+        created_at=new_post.created_at,
+        owner_id=new_post.owner_id,
+        username=current_user.username,
+        likes_count=0,
+        top_comment_id=None,
+        comments=[]
+    )
 
 
 # =========================================================
@@ -276,6 +272,7 @@ async def get_posts(
                 owner_id=post.owner_id,
                 username=post.owner.username,
                 likes_count=len(post.likes),
+                top_comment_id=post.top_comment_id,     # 置頂留言 id 欄位
                 comments=root_comments
             )
         )
@@ -292,8 +289,9 @@ async def get_my_blacklist(db: AsyncSession = Depends(get_db), current_user: mod
 
 
 ''' 加入 按讚、留言 '''
-# 這邊黑名單規則採「可見性控制」，A 封鎖 B 時，只要 B 看不到 A 的貼文和留言即可
-# 1. 發表留言 (支援巢狀)
+# =========================================================
+# 1. 發表留言 (支援巢狀、封鎖檢查)
+# =========================================================
 @app.post("/posts/{post_id}/comments", response_model=schemas.CommentOut)
 async def create_comment(
     post_id: int, 
@@ -301,9 +299,34 @@ async def create_comment(
     db: AsyncSession = Depends(get_db), 
     current_user: models.User = Depends(get_current_user)
 ):
-    # 建立模型
+    # 1. 查找該貼文及其作者
+    post_result = await db.execute(select(models.Post).where(models.Post.id == post_id))
+    post = post_result.scalars().first()
+    if not post:
+        raise HTTPException(404, "貼文不存在")
+
+    # 2. 核心防呆：檢查貼文作者是否封鎖了我
+    blocked_by_ids = await get_who_blocked_me(db, current_user.id)
+    # my_blacklist_ids = await get_my_blacklist_ids(db, current_user.id)
+
+    if post.owner_id in blocked_by_ids:
+        raise HTTPException(status_code=403, detail="由於黑名單設定，你無法對此貼文留言")
+    
+    # 3. 檢查「父留言作者」是否封鎖我 (如果是回覆某人)
+    if comment_data.parent_id:
+        parent_result = await db.execute(select(models.Comment).where(models.Comment.id == comment_data.parent_id))
+        parent_comment = parent_result.scalars().first()
+        if parent_comment and parent_comment.author_id in blocked_by_ids:
+            raise HTTPException(status_code=403, detail="由於黑名單設定，你無法回覆使用者")
+    
+    # 4. 將使用者輸入做安全處理
+    clean_content = sanitize_content(comment_data.content)
+    if not clean_content.strip():
+        raise HTTPException(status_code=400, detail="內容不可為空或是 HTML 等語法")
+
+    # 5. 建立 留言 OBJ 模型
     new_comment_obj = models.Comment(
-        content=comment_data.content,
+        content=clean_content,   # DB: 只存「純文字」
         post_id=post_id,
         author_id=current_user.id,
         parent_id=comment_data.parent_id
@@ -312,8 +335,7 @@ async def create_comment(
     await db.commit()
     await db.refresh(new_comment_obj)
     
-    # 關鍵：不要直接操作 new_comment_obj.replies
-    # 我們改用 dict 的方式轉換，並補上 Pydantic 需要的欄位
+    # 6. 發布：不要直接操作 new_comment_obj.replies，改用 dict 的方式轉換，並補上 Pydantic 需要的欄位
     return schemas.CommentOut(
         id=new_comment_obj.id,
         content=new_comment_obj.content,
@@ -324,7 +346,9 @@ async def create_comment(
         replies=[] # 這裡給空清單，完全不會觸發 SQLAlchemy 錯誤
     )
 
+# =========================================================
 # 2. 按讚功能 (切換式：按一下讚，再按一下取消)
+# =========================================================
 @app.post("/like/{target_type}/{target_id}")
 async def toggle_like(
     target_type: str, # "post" 或 "comment"
@@ -332,7 +356,31 @@ async def toggle_like(
     db: AsyncSession = Depends(get_db),
     current_user: models.User = Depends(get_current_user)
 ):
-    # 檢查是否按過讚
+    # --- 1. 查找目標物件及其作者 ---
+    target_owner_id = None
+    if target_type == "post":
+        result = await db.execute(select(models.Post).where(models.Post.id == target_id))
+        target_obj = result.scalars().first()
+        if not target_obj:
+            raise HTTPException(404, "貼文不存在")
+        target_owner_id = target_obj.owner_id
+    elif target_type == "comment":
+        result = await db.execute(select(models.Comment).where(models.Comment.id == target_id))
+        target_obj = result.scalars().first()
+        if not target_obj:
+            raise HTTPException(404, "留言不存在")
+        target_owner_id = target_obj.author_id
+    else:
+        raise HTTPException(400, "無效的目標類型")
+
+    # --- 2. 核心防呆：對方是否封鎖我 ---
+    # 檢查：對方是否封鎖我
+    blocked_by_ids = await get_who_blocked_me(db, current_user.id)
+    # my_blacklist_ids = await get_my_blacklist_ids(db, current_user.id)
+    if target_owner_id in blocked_by_ids:
+        raise HTTPException(status_code=403, detail="由於黑名單設定，你無法按讚此內容")
+    
+    # --- 3. 檢查是否按過讚 ---
     filter_args = {"user_id": current_user.id}
     if target_type == "post":
         filter_args["post_id"] = target_id
@@ -353,6 +401,82 @@ async def toggle_like(
     
     await db.commit()
     return {"message": message}
+
+
+# =========================================================
+# 📌 4. 置頂留言功能
+# =========================================================
+''' 加入 至頂留言 '''
+# 置頂 API
+@app.post("/posts/{post_id}/top-comment/{comment_id}")
+async def set_top_comment(
+    post_id: int,
+    comment_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    # 1. 先找貼文
+    result = await db.execute(
+        select(models.Post).where(models.Post.id == post_id)
+    )
+    post = result.scalars().first()
+
+    if not post:
+        raise HTTPException(status_code=404, detail="貼文不存在")
+
+    # 2. 只有貼文作者可以設定置頂留言
+    if post.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="只有貼文作者可以設定置頂留言")
+
+    # 3. 檢查留言是否存在，且必須屬於這篇貼文
+    result = await db.execute(
+        select(models.Comment).where(
+            models.Comment.id == comment_id,
+            models.Comment.post_id == post_id
+        )
+    )
+    comment = result.scalars().first()
+
+    if not comment:
+        raise HTTPException(status_code=404, detail="留言不存在或不屬於這篇貼文")
+
+    # 4. 設定置頂留言
+    post.top_comment_id = comment_id
+    await db.commit()
+
+    return {
+        "message": "已設定置頂留言",
+        "post_id": post_id,
+        "top_comment_id": comment_id
+    }
+
+# 取消置頂 API
+@app.delete("/posts/{post_id}/top-comment")
+async def clear_top_comment(
+    post_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
+    result = await db.execute(
+        select(models.Post).where(models.Post.id == post_id)
+    )
+    post = result.scalars().first()
+
+    if not post:
+        raise HTTPException(status_code=404, detail="貼文不存在")
+
+    if post.owner_id != current_user.id:
+        raise HTTPException(status_code=403, detail="只有貼文作者可以取消置頂留言")
+
+    post.top_comment_id = None
+    await db.commit()
+
+    return {
+        "message": "已取消置頂留言",
+        "post_id": post_id
+    }
+
+
 
 
 if __name__ == "__main__":

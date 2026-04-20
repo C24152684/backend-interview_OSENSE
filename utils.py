@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from fastapi import Depends, HTTPException
 from jose import jwt, JWTError
+import bleach   # 
 
 import models
 from database import get_db
@@ -110,4 +111,22 @@ def serialize_comment(
         # 🔥 核心：遞迴建立留言樹 + 黑名單過濾
         # =================================================
         replies=replies
+    )
+
+
+# =========================================================
+# 🧼 安全處理：過濾使用者輸入（防止 HTML / XSS）
+# =========================================================
+def sanitize_content(content: str) -> str:
+    """
+    將使用者輸入轉為「純文字」
+    - 移除所有 HTML tag
+    - 防止 XSS 攻擊
+    - 確保 DB 不會被污染
+    """
+    return bleach.clean(
+        content,
+        tags=[],          # ❌ 不允許任何 HTML tag
+        attributes={},    # ❌ 不允許任何屬性
+        strip=True        # ✅ 直接移除 tag（不是 escape）
     )
