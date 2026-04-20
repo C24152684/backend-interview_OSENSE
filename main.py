@@ -16,11 +16,14 @@ from database import engine, Base, get_db
 # from models import User
 # from schemas import UserCreate, UserOut, Token, TokenData, PostCreate, PostOut
 from auth import create_access_token, SECRET_KEY, ALGORITHM
-from utils import get_optional_current_user, get_blocked_user_ids, serialize_comment
+from utils import get_optional_current_user, get_who_blocked_me, get_my_blacklist_ids, serialize_comment
 
 
 
+# =========================================================
+# 🧱 初始化 DB
 # 在啟動時自動建立資料庫表 (非同步方式)
+# =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 啟動：建立資料表
@@ -34,14 +37,14 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="社群平台 API 測試", lifespan=lifespan)
 
-@app.get("/")
-async def root():
-    return {"message": "API 伺服器運作中！"}
+# @app.get("/")
+# async def root():
+#     return {"message": "API 伺服器運作中！"}
 
-# 簡單的測試端點：檢查資料庫連線
-@app.get("/test-db")
-async def test_db(db: AsyncSession = Depends(get_db)):
-    return {"status": "success", "db_session": str(db)}
+# # 簡單的測試端點：檢查資料庫連線
+# @app.get("/test-db")
+# async def test_db(db: AsyncSession = Depends(get_db)):
+#     return {"status": "success", "db_session": str(db)}
 
 
 
@@ -101,21 +104,45 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: AsyncSessi
     return {"access_token": access_token, "token_type": "bearer"}
 
 # 建立一個輔助函數：獲取當前登入的使用者
-async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
-    credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
+# async def get_current_user(token: str = Depends(oauth2_scheme), db: AsyncSession = Depends(get_db)):
+#     credentials_exception = HTTPException(status_code=401, detail="Could not validate credentials")
+#     try:
+#         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+#         username: str = payload.get("sub")
+#         if username is None:
+#             raise credentials_exception
+#     except JWTError:
+#         raise credentials_exception
+        
+#     result = await db.execute(select(models.User).where(models.User.username == username))
+#     user = result.scalars().first()
+#     if user is None:
+#         raise credentials_exception
+#     return user
+async def get_current_user(
+        token: str = Depends(oauth2_scheme),
+        db: AsyncSession = Depends(get_db),
+    ):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        username: str = payload.get("sub")
-        if username is None:
-            raise credentials_exception
+        username = payload.get("sub")
+
+        if not username:
+            raise HTTPException(401, "invalid token")
+
+        result = await db.execute(
+            select(models.User).where(models.User.username == username)
+        )
+
+        user = result.scalars().first()
+
+        if not user:
+            raise HTTPException(401, "user not found")
+
+        return user
+
     except JWTError:
-        raise credentials_exception
-        
-    result = await db.execute(select(models.User).where(models.User.username == username))
-    user = result.scalars().first()
-    if user is None:
-        raise credentials_exception
-    return user
+        raise HTTPException(401, "invalid token")
 
 # 只有登入後才能看到的測試 API
 @app.get("/users/me", response_model=schemas.UserOut)
@@ -125,7 +152,9 @@ async def read_users_me(current_user: models.User = Depends(get_current_user)):
 
 
 ''' 加入 發布貼文 '''
-# 1. 發布新貼文 (需要驗證當前使用者)
+# =========================================================
+# 📰 1. 發布新貼文 (需要驗證當前使用者)
+# =========================================================
 @app.post("/posts", response_model=schemas.PostOut)
 async def create_post(
     post_data: schemas.PostCreate, 
@@ -144,80 +173,126 @@ async def create_post(
     new_post.username = current_user.username
     return new_post
 
-# 2. 獲取所有貼文 (暫時不考慮黑名單，先求能跑通)
-# 建立一個輔助函數來遞迴處理留言資料
-def serialize_comment(comment, children_map):
+
+# =========================================================
+# 🚫 2. 黑名單功能
+# =========================================================
+@app.post("/blacklist/{blocked_id}", response_model=schemas.BlacklistMessage)
+async def toggle_blacklist(
+    blocked_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: models.User = Depends(get_current_user)
+):
     """
-    將 SQLAlchemy Comment 轉成 Pydantic schema
-    不使用 ORM 的 replies，改用 children_map 建立真正巢狀
+    封鎖 / 解除封鎖切換 API
     """
-    return schemas.CommentOut(
-        id=comment.id,
-        content=comment.content,
-        author_id=comment.author_id,
-        author_name=comment.author.username if comment.author else "未知用戶",
-        created_at=comment.created_at,
-        like_count=len(comment.likes) if comment.likes else 0,
-        parent_id=comment.parent_id,
-        # ✅ 用 children_map 建 tree（關鍵）
-        replies=[
-            serialize_comment(child, children_map)
-            for child in children_map.get(comment.id, [])
-        ]
+
+    # ❌ 防止自己封鎖自己
+    if blocked_id == current_user.id:
+        raise HTTPException(status_code=400, detail="不能封鎖自己")
+
+    # 🔍 查是否已封鎖
+    query = select(models.Blacklist).where(
+        models.Blacklist.blocker_id == current_user.id,
+        models.Blacklist.blocked_id == blocked_id
     )
 
+    result = await db.execute(query)
+    entry = result.scalars().first()
+
+    # 🔁 如果存在 → 解除封鎖
+    if entry:
+        await db.delete(entry)
+        await db.commit()
+        return {
+            "message": "已解除封鎖",
+            "blocked_id": blocked_id,
+            "is_blocked": False
+        }
+
+    # ➕ 不存在 → 新增封鎖
+    new_block = models.Blacklist(
+        blocker_id=current_user.id,
+        blocked_id=blocked_id
+    )
+
+    db.add(new_block)
+    await db.commit()
+
+    return {
+        "message": "已封鎖該使用者",
+        "blocked_id": blocked_id,
+        "is_blocked": True
+    }
+
+
+# =========================================================
+# 📰 3. 獲取所有貼文（含黑名單過濾）
+# =========================================================
 @app.get("/posts", response_model=List[schemas.PostOut])
-async def get_posts(db: AsyncSession = Depends(get_db)):
-    # ✅ Eager loading（避免 N+1）
+async def get_posts(
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[models.User] = Depends(get_optional_current_user)
+):
+    # 1. 取得封鎖我的人的 ID (這些人的貼文我不能看)
+    blocked_by_ids = await get_who_blocked_me(db, current_user.id) if current_user else set()
+
     query = select(models.Post).options(
         selectinload(models.Post.owner),
         selectinload(models.Post.likes),
-        selectinload(models.Post.comments).selectinload(models.Comment.author),
-        selectinload(models.Post.comments).selectinload(models.Comment.likes),
-        # ⚠️ replies 其實可以拿掉（我們不用了）
-        # selectinload(models.Post.comments).selectinload(models.Comment.replies)
+        selectinload(models.Post.comments).options(
+            selectinload(models.Comment.author), # 預先載入留言作者
+            selectinload(models.Comment.likes)   # 預先載入留言的按讚
+        )
     )
-    
     result = await db.execute(query)
     posts = result.scalars().all()
 
     final_posts = []
-
     for post in posts:
-        username = post.owner.username
-        likes_count = len(post.likes)
+        # 🚫黑名單規則1：貼文作者如果封鎖了我，整篇貼文看不到
+        if post.owner_id in blocked_by_ids:
+            continue
 
-        # 🔥 Step 1：建立 parent → children map
+        # 🚫黑名單規則2：貼文作者如果封鎖了我，整篇貼文看不到
+        # 建立留言樹用的 parent -> children 對照表
         children_map = {}
         for c in post.comments:
             if c.parent_id is not None:
                 children_map.setdefault(c.parent_id, []).append(c)
 
-        # 🔥 Step 2：只取 root comment
+        # 過濾根留言
         root_comments = [
-            serialize_comment(c, children_map)
+            serialize_comment(c, children_map, blocked_by_ids, schemas)
             for c in post.comments
-            if c.parent_id is None
+            if c.parent_id is None and c.author_id not in blocked_by_ids
         ]
 
-        # ✅ 組裝輸出（完全不動 ORM）
-        post_out = schemas.PostOut(
-            id=post.id,
-            content=post.content,
-            created_at=post.created_at,
-            owner_id=post.owner_id,
-            username=username,
-            likes_count=likes_count,
-            comments=root_comments
+        final_posts.append(
+            schemas.PostOut(
+                id=post.id,
+                content=post.content,
+                created_at=post.created_at,
+                owner_id=post.owner_id,
+                username=post.owner.username,
+                likes_count=len(post.likes),
+                comments=root_comments
+            )
         )
-
-        final_posts.append(post_out)
-
     return final_posts
 
+# 新增：管理介面需要的 API
+@app.get("/blacklist/me")
+async def get_my_blacklist(db: AsyncSession = Depends(get_db), current_user: models.User = Depends(get_current_user)):
+    # 查出「我主動封鎖了誰」
+    query = select(models.User).join(models.Blacklist, models.User.id == models.Blacklist.blocked_id)\
+            .where(models.Blacklist.blocker_id == current_user.id)
+    result = await db.execute(query)
+    return [{"id": u.id, "username": u.username} for u in result.scalars().all()]
 
 
 ''' 加入 按讚、留言 '''
+# 這邊黑名單規則採「可見性控制」，A 封鎖 B 時，只要 B 看不到 A 的貼文和留言即可
 # 1. 發表留言 (支援巢狀)
 @app.post("/posts/{post_id}/comments", response_model=schemas.CommentOut)
 async def create_comment(
