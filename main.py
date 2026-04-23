@@ -21,8 +21,7 @@ from utils import get_optional_current_user, get_who_blocked_me, get_my_blacklis
 
 
 # =========================================================
-# 🧱 初始化 DB
-# 在啟動時自動建立資料庫表 (非同步方式)
+# 初始化 DB，啟動時自動建立資料庫表 (非同步方式)
 # =========================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -50,26 +49,26 @@ app = FastAPI(title="社群平台 API 測試", lifespan=lifespan)
 
 ''' 加入註冊功能 '''
 # 設定密碼雜湊加密
-class PasswordHasher:
-    @staticmethod
-    def hash(password: str) -> str:
-        # 將密碼轉為 bytes
-        pwd_bytes = password.encode('utf-8')
-        # 產生 salt 並雜湊
-        salt = bcrypt.gensalt()
-        hashed = bcrypt.hashpw(pwd_bytes, salt)
-        return hashed.decode('utf-8')
+# class PasswordHasher:
+#     @staticmethod
+#     def hash(password: str) -> str:
+#         # 將密碼轉為 bytes
+#         pwd_bytes = password.encode('utf-8')
+#         # 產生 salt 並雜湊
+#         salt = bcrypt.gensalt()
+#         hashed = bcrypt.hashpw(pwd_bytes, salt)
+#         return hashed.decode('utf-8')
 
-    @staticmethod
-    def verify(password: str, hashed_password: str) -> bool:
-        return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
+#     @staticmethod
+#     def verify(password: str, hashed_password: str) -> bool:
+#         return bcrypt.checkpw(password.encode('utf-8'), hashed_password.encode('utf-8'))
     
 @app.post("/register", response_model=schemas.UserOut)
 async def register(user_data: schemas.UserCreate, db: AsyncSession = Depends(get_db)):
     # 1. 檢查使用者是否已存在
     result = await db.execute(select(models.User).where(models.User.username == user_data.username))
     if result.scalars().first():
-        raise HTTPException(status_code=400, detail="Username already registered")
+        raise HTTPException(status_code=400, detail="已經註冊過的使用者名稱")
     
     # 2. 使用原生 bcrypt 加密 (解決 passlib 相容性問題)
     pwd_bytes = user_data.password.encode('utf-8')
@@ -136,7 +135,7 @@ async def read_users_me(current_user: models.User = Depends(get_current_user)):
 
 ''' 加入 發布貼文 '''
 # =========================================================
-# 📰 1. 發布新貼文 (需要驗證當前使用者)
+# 1. 發布新貼文 (需要驗證當前使用者)
 # =========================================================
 @app.post("/posts", response_model=schemas.PostOut)
 async def create_post(
@@ -171,7 +170,7 @@ async def create_post(
 
 
 # =========================================================
-# 🚫 2. 黑名單功能
+# 2. 黑名單功能
 # =========================================================
 @app.post("/blacklist/{blocked_id}", response_model=schemas.BlacklistMessage)
 async def toggle_blacklist(
@@ -183,11 +182,11 @@ async def toggle_blacklist(
     封鎖 / 解除封鎖切換 API
     """
 
-    # ❌ 防止自己封鎖自己
+    # 防止自己封鎖自己
     if blocked_id == current_user.id:
         raise HTTPException(status_code=400, detail="不能封鎖自己")
 
-    # 🔍 查是否已封鎖
+    # 查是否已封鎖
     query = select(models.Blacklist).where(
         models.Blacklist.blocker_id == current_user.id,
         models.Blacklist.blocked_id == blocked_id
@@ -196,7 +195,7 @@ async def toggle_blacklist(
     result = await db.execute(query)
     entry = result.scalars().first()
 
-    # 🔁 如果存在 → 解除封鎖
+    # 如果存在 → 解除封鎖
     if entry:
         await db.delete(entry)
         await db.commit()
@@ -206,7 +205,7 @@ async def toggle_blacklist(
             "is_blocked": False
         }
 
-    # ➕ 不存在 → 新增封鎖
+    # 不存在 → 新增封鎖
     new_block = models.Blacklist(
         blocker_id=current_user.id,
         blocked_id=blocked_id
@@ -223,7 +222,7 @@ async def toggle_blacklist(
 
 
 # =========================================================
-# 📰 3. 獲取所有貼文（含黑名單過濾）
+# 3. 獲取所有貼文（含黑名單過濾）
 # =========================================================
 @app.get("/posts", response_model=List[schemas.PostOut])
 async def get_posts(
@@ -246,11 +245,11 @@ async def get_posts(
 
     final_posts = []
     for post in posts:
-        # 🚫黑名單規則1：貼文作者如果封鎖了我，整篇貼文看不到
+        # 黑名單規則1：貼文作者如果封鎖了我，整篇貼文看不到
         if post.owner_id in blocked_by_ids:
             continue
 
-        # 🚫黑名單規則2：貼文作者如果封鎖了我，整篇貼文看不到
+        # 黑名單規則2：貼文作者如果封鎖了我，整篇貼文看不到
         # 建立留言樹用的 parent -> children 對照表
         children_map = {}
         for c in post.comments:
@@ -403,9 +402,7 @@ async def toggle_like(
     return {"message": message}
 
 
-# =========================================================
-# 📌 4. 置頂留言功能
-# =========================================================
+
 ''' 加入 至頂留言 '''
 # 置頂 API
 @app.post("/posts/{post_id}/top-comment/{comment_id}")

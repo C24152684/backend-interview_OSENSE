@@ -10,12 +10,12 @@ SQLALCHEMY_DATABASE_URL = "sqlite+aiosqlite:///./social_platform.db"
 
 engine = create_async_engine(
     SQLALCHEMY_DATABASE_URL, 
-    echo=True, # 開發階段設為 True 可以看 SQL 語法，提交前建議改為 False
-    connect_args={"check_same_thread": False} 
+    echo=False,                                 # 將程式執行的 SQL 印在終端機上
+    connect_args={"check_same_thread": False}   # 允許不同的執行緒共用同一個資料庫連線
 )
 
 AsyncSessionLocal = async_sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
+    engine, class_=AsyncSession, expire_on_commit=False     # 非同步環境下，防止在 commit 之後，還想讀取物件屬性
 )
 
 Base = declarative_base()

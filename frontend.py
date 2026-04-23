@@ -436,11 +436,11 @@ else:
     st.subheader("🌍 貼文列表")
     
     # 先更新「誰封鎖我」：避免 blocked_by_ids 永遠是舊的
-    blk_resp = requests.get(f"{API_URL}/blacklist/who_blocked_me", headers=headers)
-    if blk_resp.status_code == 200:
-        st.session_state.blocked_by_ids = set(map(int, blk_resp.json()))
-    else:
-        st.session_state.blocked_by_ids = set()
+    # blk_resp = requests.post(f"{API_URL}/blacklist/who_blocked_me", headers=headers)
+    # if blk_resp.status_code == 200:
+    #     st.session_state.blocked_by_ids = set(map(int, blk_resp.json()))
+    # else:
+    #     st.session_state.blocked_by_ids = set()
 
     # 再抓貼文
     posts_resp = requests.get(f"{API_URL}/posts", headers=headers)
